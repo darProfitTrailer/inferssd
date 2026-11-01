@@ -78,6 +78,8 @@ jobs:
           mypy --config-file framework/pyproject.toml framework/src
       - name: Framework tests
         run: python3 -m pytest -q bench/tests framework/tests
+      - name: Expert pack inspection checks
+        run: python3 tests/integration/test-expert-pack-inspect.py
       - name: Framework tests on Python 3.9
         run: |
           python3.9 -m venv .venv39

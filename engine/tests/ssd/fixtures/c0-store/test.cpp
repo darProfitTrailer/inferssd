@@ -194,12 +194,15 @@ int main() {
         check(aliases->locate(name.c_str(), 5, 64, found) && found.offset % 4096 == 3811,
               "alias must retain unaligned logical offset");
 
-        // Preserve permissive legacy integer parsing unchanged.
+        // Intentional safety divergence: the frozen oracle accepts numeric
+        // suffixes, but publishing a different extent than the TSV specifies
+        // must fail in the production parser.
         tsv(a1, "source_path\tmodel_offset\texpert\tnbytes\ttensor\r\n" + data.string() +
             "\t4097tail\t3tail\t64tail\t" + name + "\r\n");
-        auto permissive = compare({{}, {a1.string()}, {}, false}, true);
-        check(permissive->locate(name.c_str(), 3, 64, found) && found.offset == 4097,
-              "legacy numeric suffix parsing changed");
+        const c0::description malformed{{}, {a1.string()}, {}, false};
+        check(original::open(malformed), "legacy numeric suffix fixture changed");
+        check(!c0::expert_index::open(malformed), "numeric suffix alias accepted");
+        original::clear();
         tsv(a1, "tensor\texpert\tnbytes\tsource_path\toffset_bytes\n" + alias_row(name, 3, 64, data, 4097));
         compare({{}, {a1.string()}, {}, false}, true);
         pack(p2, {{name, 3, 4096, 64}}, 64);
@@ -234,11 +237,12 @@ int main() {
         overwrite(24, uint64_t(10000001));
         compare({{p2.string()}, {}, {}, false}, false);
         pack(p2, {{std::string(128, 'n'), -1, 4096, 0}});
-        auto permissive_pack = compare({{p2.string()}, {}, {}, false}, true);
-        check(std::strlen(permissive_pack->entries_for_test()[0].tensor) == 127,
-              "legacy v1 tensor-name truncation changed");
-        check(!permissive_pack->locate(std::string(127, 'n').c_str(), -1, 0, found),
-              "invalid logical query should fail without tightening pack loader");
+        // The frozen oracle publishes this unresolvable key. Production now
+        // rejects negative expert IDs, empty extents and unterminated names.
+        const c0::description invalid_pack{{p2.string()}, {}, {}, false};
+        check(original::open(invalid_pack), "legacy invalid pack fixture changed");
+        check(!c0::expert_index::open(invalid_pack), "invalid pack entry published");
+        original::clear();
         pack(p2, {{name, 3, 4096, 64}});
         fs::resize_file(p2, 60);
         compare({{p2.string()}, {}, {}, false}, false);

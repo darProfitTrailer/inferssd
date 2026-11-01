@@ -14,8 +14,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "gguf-py"))
 
-from gguf import GGUFReader  # noqa: E402
-
 MAGIC = b"GGMLMOEPACKv1\0\0\0"
 HEADER_STRUCT = struct.Struct("<16sIIQQ")
 ENTRY_STRUCT = struct.Struct("<128siIQQ")
@@ -76,6 +74,9 @@ def slice_sort_key(slice_ref: SliceRef, layout: str) -> tuple[object, ...]:
 
 
 def collect_slices(inputs: list[Path], layout: str) -> list[SliceRef]:
+    # Inspection only needs the standard library; model conversion needs gguf.
+    from gguf import GGUFReader
+
     slices: list[SliceRef] = []
     tensor_patterns = (
         ".ffn_up_exps.",
@@ -173,6 +174,11 @@ def inspect_pack(path: Path, limit: int) -> None:
         magic, version, header_size, n_entries, data_start = HEADER_STRUCT.unpack(header)
         if magic != MAGIC or version != 1:
             raise SystemExit("not a v1 MoE expert pack")
+        file_size = os.fstat(f.fileno()).st_size
+        if (header_size < HEADER_STRUCT.size or data_start < header_size
+                or data_start < HEADER_STRUCT.size + n_entries * ENTRY_STRUCT.size
+                or data_start > file_size):
+            raise SystemExit("pack index/payload boundary is invalid")
         print(f"version={version} header_size={header_size} entries={n_entries} data_start={data_start}")
         counts: dict[str, int] = {}
         total = 0
@@ -182,6 +188,10 @@ def inspect_pack(path: Path, limit: int) -> None:
             if len(raw) != ENTRY_STRUCT.size:
                 raise SystemExit("pack index is truncated")
             name_raw, expert_idx, _reserved, offset, nbytes = ENTRY_STRUCT.unpack(raw)
+            if not name_raw[0] or b"\0" not in name_raw or expert_idx < 0 or nbytes == 0:
+                raise SystemExit("pack entry has an invalid key or size")
+            if offset < data_start or offset > file_size or nbytes > file_size - offset:
+                raise SystemExit("pack entry is outside payload bounds")
             name = name_raw.split(b"\0", 1)[0].decode("utf-8")
             counts[name] = counts.get(name, 0) + 1
             total += nbytes
