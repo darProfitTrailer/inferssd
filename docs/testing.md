@@ -24,6 +24,15 @@ needs `python3` with `jinja2`; exclude them with `ctest -E` where these are unav
 
 ## Shared expert store
 
+The native alias reader accepts at most 4095 bytes before each LF, including
+any CR. It rejects embedded NULs, overlong physical lines and malformed numeric
+fields rather than publishing a truncated interpretation. Complete final rows
+without LF remain valid. Pack entries require a nonempty, NUL-terminated name,
+a nonnegative expert ID, a nonzero size and a range within the declared payload.
+The fixed legacy oracle retains its old permissive behavior; explicit divergence
+cases document these stricter rejection rules. Python CI also runs the model-free
+pack-inspection subprocess tests with site packages disabled.
+
 `LLAMA_SSD_STORE` is on by default on Linux, macOS and Windows. The store is a
 static library that only llama links; each context owns its source index. The
 supported configuration uses bundled ggml, shared or static libraries, the CPU

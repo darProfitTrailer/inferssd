@@ -19,6 +19,34 @@ struct close_file {
 FILE * open_regular_file(const char * path) noexcept {
     return ssd::platform::open_stream(path);
 }
+bool parse_unsigned_decimal(const char * text, uint64_t maximum, uint64_t & value) {
+    value = 0;
+    if (!text || !*text) { return false; }
+    for (; *text; ++text) {
+        if (*text < '0' || *text > '9') { return false; }
+        const uint64_t digit = uint64_t(*text - '0');
+        if (value > (maximum - digit) / 10) { return false; }
+        value = value * 10 + digit;
+    }
+    return true;
+}
+enum class tsv_line_result { line, end, invalid };
+// Validate every input byte before any C-string operation. Bound memory and
+// reject an overlong physical line instead of interpreting its tail as a row.
+tsv_line_result read_tsv_line(FILE * file, char * buffer, size_t capacity) {
+    size_t size = 0;
+    for (;;) {
+        const int byte = std::fgetc(file);
+        if (byte == EOF) {
+            if (std::ferror(file)) { return tsv_line_result::invalid; }
+            buffer[size] = '\0';
+            return size ? tsv_line_result::line : tsv_line_result::end;
+        }
+        if (byte == '\n') { buffer[size] = '\0'; return tsv_line_result::line; }
+        if (byte == 0 || size + 1 >= capacity) { return tsv_line_result::invalid; }
+        buffer[size++] = char(byte);
+    }
+}
 // A source is borrowed by the catalog only after vector insertion succeeds.
 struct pending_source_handles {
     expert_pack_source & source;
@@ -143,7 +171,8 @@ bool expert_pack_load_source(const char *path, int32_t source_idx, std::vector<e
             !expert_pack_read_exact(probe, &n_entries, sizeof(n_entries)) ||
             !expert_pack_read_exact(probe, &data_start, sizeof(data_start)) ||
             std::memcmp(magic, "GGMLMOEPACKv1", 13) != 0 ||
-            version != 1 || header_size < 40 || data_start < header_size || n_entries > 10000000ULL) {
+            version != 1 || header_size < 40 || data_start < header_size || n_entries > 10000000ULL ||
+            n_entries > (data_start - 40) / 152) {
         std::fprintf(stderr, "[moe_stream_batch] expert pack: invalid header: %s\n", path);
         std::fclose(probe);
         return false;
@@ -158,6 +187,10 @@ bool expert_pack_load_source(const char *path, int32_t source_idx, std::vector<e
         return false;
     }
     expert_pack_source &source = g_expert_pack.sources.back();
+    if (data_start > source.file_size) {
+        std::fprintf(stderr, "[moe_stream_batch] expert pack: payload starts beyond file: %s\n", path);
+        return false;
+    }
     if (std::fseek(source.file, 40, SEEK_SET) != 0) {
         std::fprintf(stderr, "[moe_stream_batch] expert pack: seek index failed: %s\n", path);
         return false;
@@ -176,7 +209,14 @@ bool expert_pack_load_source(const char *path, int32_t source_idx, std::vector<e
             std::fprintf(stderr, "[moe_stream_batch] expert pack: short index: %s\n", path);
             return false;
         }
-        e.tensor[sizeof(e.tensor) - 1] = '\0';
+        if (!e.tensor[0] || !std::memchr(e.tensor, '\0', sizeof(e.tensor)) || e.expert_idx < 0 || !e.nbytes) {
+            std::fprintf(stderr, "[moe_stream_batch] expert pack: invalid entry key or size: %s\n", path);
+            return false;
+        }
+        if (e.offset < data_start || e.offset > source.file_size || e.nbytes > source.file_size - e.offset) {
+            std::fprintf(stderr, "[moe_stream_batch] expert pack: entry outside payload: %s\n", path);
+            return false;
+        }
         e.source_idx = source_idx;
     }
 
@@ -229,8 +269,8 @@ bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_e
 
     char line[4096];
     std::vector<char *> fields;
-    if (!std::fgets(line, sizeof(line), file)) {
-        std::fprintf(stderr, "[moe_stream_batch] GGUF alias: empty TSV: %s\n", path);
+    if (read_tsv_line(file, line, sizeof(line)) != tsv_line_result::line) {
+        std::fprintf(stderr, "[moe_stream_batch] GGUF alias: empty or invalid TSV header: %s\n", path);
         return false;
     }
     expert_pack_split_tsv_line(line, fields);
@@ -257,7 +297,13 @@ bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_e
     uint64_t loaded = 0;
     uint64_t skipped_duplicates = 0;
     uint64_t bad_rows = 0;
-    while (std::fgets(line, sizeof(line), file)) {
+    for (;;) {
+        const auto result = read_tsv_line(file, line, sizeof(line));
+        if (result == tsv_line_result::end) { break; }
+        if (result == tsv_line_result::invalid) {
+            std::fprintf(stderr, "[moe_stream_batch] GGUF alias: invalid or overlong TSV line: %s\n", path);
+            return false;
+        }
         expert_pack_split_tsv_line(line, fields);
         ++rows;
         const int need_cols = std::max(std::max(col_tensor, col_expert), std::max(col_nbytes, std::max(col_source, col_offset))) + 1;
@@ -267,9 +313,14 @@ bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_e
         }
         const char *tensor = fields[(size_t)col_tensor];
         const char *source_path = fields[(size_t)col_source];
-        const int expert_idx = (int)std::strtol(fields[(size_t)col_expert], nullptr, 10);
-        const uint64_t nbytes = (uint64_t)std::strtoull(fields[(size_t)col_nbytes], nullptr, 10);
-        const uint64_t offset = (uint64_t)std::strtoull(fields[(size_t)col_offset], nullptr, 10);
+        uint64_t expert_value = 0, nbytes = 0, offset = 0;
+        if (!parse_unsigned_decimal(fields[(size_t)col_expert], INT32_MAX, expert_value) ||
+                !parse_unsigned_decimal(fields[(size_t)col_nbytes], UINT64_MAX, nbytes) ||
+                !parse_unsigned_decimal(fields[(size_t)col_offset], UINT64_MAX, offset)) {
+            ++bad_rows;
+            continue;
+        }
+        const int expert_idx = int(expert_value);
         if (!tensor || !tensor[0] || !source_path || !source_path[0] ||
                 expert_idx < 0 || nbytes == 0 || std::strlen(tensor) >= 128) {
             ++bad_rows;
